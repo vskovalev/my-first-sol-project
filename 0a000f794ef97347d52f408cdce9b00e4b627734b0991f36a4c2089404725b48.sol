@@ -56,7 +56,6 @@ contract Log
     }
 
     Message[] public History;
-
     Message LastMsg;
 
     function AddMessage(address _adr,uint _val,string _data)
