@@ -1,0 +1,130 @@
+name: Security Scan
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: europe-west1
+  PROJECT: gcp-hackathon-497208
+  ENTRYPOINT_URL: https://entrypoint-dev-t62uekjd3q-ew.a.run.app
+  # Not secrets — WIF uses GitHub's OIDC token; trust is enforced in GCP.
+  WORKLOAD_IDENTITY_PROVIDER: projects/344586321445/locations/global/workloadIdentityPools/github-pool/providers/github
+  SERVICE_ACCOUNT: github-actions@gcp-hackathon-497208.iam.gserviceaccount.com
+
+jobs:
+  scan-changed-files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed Solidity files
+        id: changed
+        run: |
+          mapfile -t changed_files < <(
+            git diff --name-only --diff-filter=ACMR \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}" \
+              -- '*.sol'
+          )
+
+          if [ "${#changed_files[@]}" -eq 0 ]; then
+            echo "any_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changed .sol files to scan."
+            exit 0
+          fi
+
+          files_json='[]'
+          for file_path in "${changed_files[@]}"; do
+            if [ ! -f "$file_path" ]; then
+              echo "Skipping missing file: $file_path"
+              continue
+            fi
+            files_json=$(
+              jq -n \
+                --argjson files "$files_json" \
+                --arg path "$file_path" \
+                --rawfile content "$file_path" \
+                '$files + [{path: $path, content: $content}]'
+            )
+          done
+
+          file_count=$(echo "$files_json" | jq 'length')
+          if [ "$file_count" -eq 0 ]; then
+            echo "any_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No readable changed .sol files to scan."
+            exit 0
+          fi
+
+          echo "$files_json" > changed-files.json
+          echo "any_changed=true" >> "$GITHUB_OUTPUT"
+          echo "file_count=$file_count" >> "$GITHUB_OUTPUT"
+
+          echo "Changed files to scan:"
+          printf '  - %s\n' "${changed_files[@]}"
+
+      - name: Authenticate to Google Cloud
+        if: steps.changed.outputs.any_changed == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.changed.outputs.any_changed == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run security scan
+        if: steps.changed.outputs.any_changed == 'true'
+        id: scan
+        run: |
+          set -euo pipefail
+
+          payload=$(
+            jq -n \
+              --arg repo "${{ github.repository }}" \
+              --argjson pr_number "${{ github.event.pull_request.number }}" \
+              --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+              --slurpfile files changed-files.json \
+              '{repo: $repo, pr_number: $pr_number, head_sha: $head_sha, files: $files[0]}'
+          )
+
+          response_file=$(mktemp)
+          http_code=$(
+            curl --http1.1 --max-time 200 -sS -X POST "$ENTRYPOINT_URL/v1/scan" \
+              -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              -o "$response_file" \
+              -w '%{http_code}'
+          )
+
+          response_body=$(cat "$response_file")
+          rm -f "$response_file"
+
+          echo "Scan HTTP status: $http_code"
+          echo "Scan response:"
+          echo "$response_body" | jq . 2>/dev/null || echo "$response_body"
+
+          {
+            echo "scan_response<<EOF"
+            echo "$response_body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "scan_status=$http_code" >> "$GITHUB_OUTPUT"
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::Security scan request failed with HTTP $http_code"
+            exit 1
+          fi
+
+      - name: Skip scan
+        if: steps.changed.outputs.any_changed != 'true'
+        run: echo "No changed Solidity files — scan skipped."

@@ -1,9 +1,3 @@
-
-
-
-
-
-
 pragma solidity ^0.4.19;
 
 contract ETH_VAULT
